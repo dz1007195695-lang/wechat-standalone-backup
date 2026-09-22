@@ -1,0 +1,8 @@
+{
+  "appId": "wx9e6197b1fa766a55",
+  "appSecret": "YOUR_APP_SECRET",
+  "token": "wechat_bind_2024",
+  "encodingAESKey": "YOUR_ENCODING_AES_KEY",
+  "menuKey": "BIND_QR",
+  "enabled": true
+}
