@@ -1,0 +1,57 @@
+      await tgSendMessage(tenantId, "[图片]", conv.telegramTopicId);
+            }
+          } else {
+            await tgSendMessage(tenantId, p.text, conv.telegramTopicId);
+          }
+        } catch (e) {
+          console.error(`[Telegram][${tenantId}] 同步回复失败: ${e.message}`);
+        }
+      }
+      
+      res.end(JSON.stringify({ ok: true }));
+    } catch (e) {
+      res.end(JSON.stringify({ ok: false, error: e.message }));
+    }
+    return;
+  }
+
+  if (req.method === "POST" && pathname === "/api/qrcode/start") {
+    try {
+      const p = await readBody(req).catch(() => ({}));
+      const tenantId = p.tenantId || url.searchParams.get("tenant") || (req.session ? req.session.tenantId : "default");
+      const d = await startQrLogin(tenantId);
+      const qrcode_url = d.qrcodeUrl || (d.qrBuffer ? ("data:image/png;base64," + d.qrBuffer.toString("base64")) : "");
+      res.end(JSON.stringify({ ok: true, session_key: d.sessionKey, qrcode_url, qrcode_text: d.qrcodeText }));
+    } catch (e) {
+      console.error("[api/qrcode/start]", e.message);
+      res.end(JSON.stringify({ ok: false, error: e.message }));
+    }
+    return;
+  }
+
+  if (req.method === "GET" && pathname === "/api/qrcode/status") {
+    const d = await pollQrStatus(url.searchParams.get("session_key") || "");
+    res.end(JSON.stringify(d));
+    return;
+  }
+
+  res.writeHead(404);
+  res.end();
+});
+
+loadData();
+loadQrConfig();
+loadMpConfig();
+loadWeixinAccounts();
+for (const accountId of Object.keys(weixinAccounts)) monitorAccount(accountId);
+startAllTelegramBots();
+
+server.listen(PORT, () => {
+  console.log("==================================================");
+  console.log("  微信客服工作台已启动 (支持图片收发)");
+  console.log("  后台管理入口: http://localhost:" + PORT);
+  console.log("  独立落地页: http://localhost:" + PORT + "/qr.html");
+  console.log("  免扫码授权: http://localhost:" + PORT + "/bind.html");
+  console.log("  公众号回调: http://localhost:" + PORT + "/wechat/callback");
+  console.log("==================================================");
+});
