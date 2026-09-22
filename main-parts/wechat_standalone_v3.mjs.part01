@@ -1,0 +1,225 @@
+import QRCode from "qrcode";
+import http from "node:http";
+import https from "node:https";
+import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
+import { fileURLToPath } from "node:url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+// 自动判断环境：Windows 本地测试用相对路径，Linux 服务器用 /root/wechat-accounts
+const WEIXIN_ACCOUNTS_DIR = process.platform === "win32"
+  ? path.join(__dirname, "wechat-accounts")
+  : "/root/wechat-accounts";
+const DATA_FILE = path.join(__dirname, "wechat_data.json");
+const QR_CONFIG_FILE = path.join(__dirname, "qr_config.json");
+const PORT = 9000;
+const ILINK_APP_ID = "bot";
+const CHANNEL_VERSION = "2.4.8";
+const ILINK_APP_CLIENT_VERSION = ((2 & 0xff) << 16) | ((4 & 0xff) << 8) | 8;
+const BOT_AGENT = "OpenClaw";
+const DEFAULT_LONG_POLL_TIMEOUT = 35000;
+const QR_API_BASE = "https://ilinkai.weixin.qq.com";
+const DEFAULT_BOT_TYPE = "3";
+const CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c";
+
+// ========== 公众号配置 ==========
+const MP_CONFIG_FILE = path.join(__dirname, "wechat_mp_config.json");
+const QR_TEMPLATE_FILE = path.join(__dirname, "qr_template.png");
+// 公众号配置按工作区隔离: { tenantId: { appId, appSecret, token, encodingAESKey, menuKey, enabled } }
+let mpConfigs = {};
+let mpAccessTokens = {}; // { tenantId: { token, expiresAt } }
+
+function getMpConfig(tenantId) {
+  if (!mpConfigs[tenantId]) {
+    mpConfigs[tenantId] = { appId: "", appSecret: "", token: "", encodingAESKey: "", menuKey: "BIND_QR", enabled: false };
+  }
+  return mpConfigs[tenantId];
+}
+
+function loadMpConfig() {
+  if (fs.existsSync(MP_CONFIG_FILE)) {
+    try {
+      const content = fs.readFileSync(MP_CONFIG_FILE, "utf-8").trim();
+      if (content) {
+        const data = JSON.parse(content);
+        // 兼容旧格式（全局配置）
+        if (data.appId !== undefined) {
+          mpConfigs = { "default": data };
+        } else {
+          mpConfigs = data;
+        }
+      }
+    } catch (e) {}
+  }
+}
+function saveMpConfig() {
+  try { fs.writeFileSync(MP_CONFIG_FILE, JSON.stringify(mpConfigs, null, 2), "utf-8"); } catch (e) {}
+}
+
+// ========== 落地页配置 ==========
+let qrPageConfig = {
+  background: "linear-gradient(135deg, #1a3a2a 0%, #0d2818 100%)",
+  title: "企业微信客服接入中心",
+  subtitle: "请使用需要接入后台的微信扫描二维码完成授权",
+  cardBgColor: "#ffffff"
+};
+
+function loadQrConfig() {
+  if (fs.existsSync(QR_CONFIG_FILE)) {
+    try {
+      const content = fs.readFileSync(QR_CONFIG_FILE, "utf-8").trim();
+      if (content) qrPageConfig = { ...qrPageConfig, ...JSON.parse(content) };
+    } catch (e) {}
+  }
+}
+
+function saveQrConfigSync() {
+  try {
+    fs.writeFileSync(QR_CONFIG_FILE, JSON.stringify(qrPageConfig, null, 2), "utf-8");
+  } catch (e) {}
+}
+
+// ========== 数据存储 ==========
+let weixinAccounts = {};
+let store = {
+  tenants: { "default": { name: "默认工作区", createdAt: Date.now() } },
+  currentTenant: "default",
+  accounts: {},
+  nextMsgId: 0,
+  users: { "admin": { password: "admin123", tenantId: "default", role: "admin", createdAt: Date.now() } },
+  autoReply: {}, // { tenantId: { enabled: true, content: "欢迎语" } }
+  telegram: {}, // { tenantId: { botToken, chatId, enabled } }
+  mpMessages: {} // { tenantId: { welcomeText, bindSuccessText, qrTemplate, qrX, qrY, qrSize } }
+};
+let saveTimer = null;
+const qrSessions = new Map();
+
+// ========== 用户认证 ==========
+const sessions = new Map(); // token -> { username, tenantId, role, expires }
+
+function hashPassword(pwd) {
+  return crypto.createHash("sha256").update(pwd + "wechat_saas_salt_2024").digest("hex");
+}
+
+function createSession(username, tenantId, role) {
+  const token = crypto.randomBytes(32).toString("hex");
+  sessions.set(token, { username, tenantId, role, expires: Date.now() + 7 * 24 * 60 * 60 * 1000 });
+  return token;
+}
+
+function getSession(req) {
+  const cookie = req.headers.cookie || "";
+  const match = cookie.match(/auth_token=([^;]+)/);
+  if (!match) return null;
+  const token = match[1];
+  const s = sessions.get(token);
+  if (!s || s.expires < Date.now()) { sessions.delete(token); return null; }
+  return s;
+}
+
+function requireAuth(req, res, needAdmin = false) {
+  const s = getSession(req);
+  if (!s) { res.writeHead(401); res.end(JSON.stringify({ error: "未登录" })); return null; }
+  if (needAdmin && s.role !== "admin") { res.writeHead(403); res.end(JSON.stringify({ error: "无权限" })); return null; }
+  return s;
+}
+
+function loadData() {
+  if (fs.existsSync(DATA_FILE)) {
+    try {
+      const content = fs.readFileSync(DATA_FILE, "utf-8").trim();
+      if (content) {
+        const d = JSON.parse(content);
+        store.tenants = d.tenants || { "default": { name: "默认工作区" } };
+        store.currentTenant = d.currentTenant || "default";
+        store.accounts = d.accounts || {};
+        store.nextMsgId = d.next_msg_id || d.nextMsgId || 0;
+        store.users = d.users || { "admin": { password: "admin123", tenantId: "default", role: "admin" } };
+        store.autoReply = d.autoReply || {};
+        store.telegram = d.telegram || {};
+        store.mpMessages = d.mpMessages || {};
+        for (const aid of Object.keys(store.accounts)) {
+          if (!store.accounts[aid].tenantId) store.accounts[aid].tenantId = "default";
+          if (!store.accounts[aid].conversations) store.accounts[aid].conversations = {};
+          for (const cid of Object.keys(store.accounts[aid].conversations)) {
+            const c = store.accounts[aid].conversations[cid];
+            if (!c.lastActive && c.messages && c.messages.length > 0) {
+              c.lastActive = c.messages[c.messages.length - 1].time * 1000;
+            }
+          }
+        }
+      }
+    } catch (e) { store.accounts = {}; }
+  }
+}
+
+function saveDataSync() {
+  try {
+    fs.writeFileSync(DATA_FILE, JSON.stringify({
+      tenants: store.tenants,
+      currentTenant: store.currentTenant,
+      accounts: store.accounts,
+      next_msg_id: store.nextMsgId,
+      users: store.users,
+      autoReply: store.autoReply,
+      telegram: store.telegram,
+      mpMessages: store.mpMessages
+    }, null, 2), "utf-8");
+  } catch (e) {}
+}
+
+function scheduleSave() {
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => { saveTimer = null; saveDataSync(); }, 300);
+}
+
+function getAccountData(accountId) {
+  if (!store.accounts[accountId]) {
+    store.accounts[accountId] = {
+      tenantId: store.currentTenant,
+      remark: accountId.slice(0, 8),
+      conversations: {},
+      pinned: false
+    };
+  }
+  if (!store.accounts[accountId].conversations) store.accounts[accountId].conversations = {};
+  return store.accounts[accountId];
+}
+
+function getConversation(accountId, userId) {
+  const acc = getAccountData(accountId);
+  if (!acc.conversations[userId]) {
+    // 自动生成日期备注：M月D日第N个粉
+    const now = new Date();
+    const month = now.getMonth() + 1;
+    const day = now.getDate();
+    const dateStr = `${month}月${day}日`;
+    const oldDateStr = `${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+    let todayCount = 0;
+    for (const aid of Object.keys(store.accounts)) {
+      const a = store.accounts[aid];
+      for (const uid of Object.keys(a.conversations || {})) {
+        const c = a.conversations[uid];
+        const r = (c && c.remark) || "";
+        if (r.includes(dateStr) || r.startsWith(oldDateStr)) todayCount++;
+      }
+    }
+    const remark = `${dateStr}第${todayCount + 1}个粉`;
+    acc.conversations[userId] = {
+      remark: remark,
+      messages: [],
+      unread: 0,
+      pinned: false,
+      lastActive: Date.now()
+    };
+    scheduleSave();
+  }
+  return acc.conversations[userId];
+}
+
+// ========== Telegram 对接 ==========
+const telegramBots = {}; // { tenantId: { botToken, chatId, offset, polling } }
+const telegramTopicMap = {}; // { tenantId: { topicId: { accountId, userId } } }
+
+function getTelegramConfig(tenantId) {
