@@ -1,0 +1,6 @@
+wechat-standalone 4.1版 全量含密钥备份
+timestamp: 2026-09-23 07:26:42 CST
+hostname: ECS20260911898680
+backup_dir: /root/backups/wechat-standalone-v4.1-secrets-20260923-072529
+includes_secrets: ipoasis.env, tg_bridge.env, wechat_mp_config.json, openclaw-weixin-accounts, tg_*.session, wechat_data.json, accounts.json
+note: /root/wechat-accounts/ was empty at backup time; openclaw-weixin-accounts holds live session JSON
