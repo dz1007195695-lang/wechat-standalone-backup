@@ -1,0 +1,216 @@
+ return { botToken: "", chatId: "3951386478", enabled: true }; }
+
+function saveTelegramConfig(tenantId, config) {
+  store.telegram[tenantId] = config;
+  scheduleSave();
+  // 重启该工作区的 bot
+  if (telegramBots[tenantId]) {
+    telegramBots[tenantId].shouldStop = true;
+    delete telegramBots[tenantId];
+  }
+  if (config.enabled && config.botToken && config.chatId) {
+    startTelegramBot(tenantId);
+  }
+}
+
+async function tgApi(tenantId, method, params = {}) {
+  const cfg = getTelegramConfig(tenantId);
+  if (!cfg.botToken) throw new Error("Telegram bot token 未配置");
+  const url = `https://api.telegram.org/bot${cfg.botToken}/${method}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(params)
+  });
+  const data = await res.json();
+  if (!data.ok) throw new Error(`Telegram API ${method} 失败: ${JSON.stringify(data)}`);
+  return data.result;
+}
+
+async function tgCreateTopic(tenantId, name) {
+  const res = await fetch("http://127.0.0.1:9002/create_topic", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: "3951386478", name: name.slice(0,128) })
+  });
+  return await res.json();
+}
+
+async function tgSendMessage(tenantId, text, topicId) {
+  const res = await fetch("http://127.0.0.1:9002/send_text", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: "3951386478", thread_id: topicId, text: text })
+  });
+  return await res.json();
+}
+
+async function tgSendPhoto(tenantId, photoBuffer, caption, topicId) {
+  const cfg = getTelegramConfig(tenantId);
+  if (!cfg.botToken) throw new Error("Telegram bot token 未配置");
+  
+  // 用 multipart/form-data 直接上传图片
+  const form = new FormData();
+  form.append("chat_id", cfg.chatId);
+  if (topicId) form.append("message_thread_id", topicId);
+  if (caption) form.append("caption", caption);
+  form.append("photo", new Blob([photoBuffer], { type: "image/jpeg" }), "photo.jpg");
+  
+  const url = `https://api.telegram.org/bot${cfg.botToken}/sendPhoto`;
+  const res = await fetch(url, { method: "POST", body: form });
+  const data = await res.json();
+  if (!data.ok) throw new Error(`Telegram sendPhoto 失败: ${JSON.stringify(data)}`);
+  return data.result;
+}
+
+// 获取或创建话题
+async function getOrCreateTopic(tenantId, accountId, userId) {
+  const conv = getConversation(accountId, userId);
+  if (conv.telegramTopicId) return conv.telegramTopicId;
+  
+  const topicName = conv.remark || userId.slice(0, 12);
+  try {
+    const topic = await tgCreateTopic(tenantId, topicName);
+    conv.telegramTopicId = topic.message_thread_id;
+    if (!telegramTopicMap[tenantId]) telegramTopicMap[tenantId] = {};
+    telegramTopicMap[tenantId][topic.message_thread_id] = { accountId, userId };
+    scheduleSave();
+    console.log(`[Telegram][${tenantId}] 创建话题: ${topicName} -> topicId=${topic.message_thread_id}`);
+    return topic.message_thread_id;
+  } catch (e) {
+    console.error(`[Telegram][${tenantId}] 创建话题失败: ${e.message}`);
+    return null;
+  }
+}
+
+// 微信消息转发到 Telegram
+async function forwardWechatToTelegram(tenantId, accountId, userId, text, media) {
+  try {
+    const topicId = await getOrCreateTopic(tenantId || "default", accountId, userId);
+    if (!topicId) return;
+    if (media && media.type === "image" && media.encrypt_query_param) {
+      const buf = await downloadAndDecryptMedia(media);
+      if (!buf) throw new Error("下载图片失败");
+      const form = new FormData();
+      form.append("chat_id", "3951386478");
+      form.append("thread_id", String(topicId));
+      form.append("photo", new Blob([buf]), "wechat.jpg");
+      await fetch("http://127.0.0.1:9002/send_photo", { method: "POST", body: form });
+      console.log("[Telegram] 图片已发:", topicId);
+    } else {
+      await tgSendMessage(tenantId || "default", "粉丝: " + (text || ""), topicId);
+      console.log("[Telegram] 文字已发:", topicId);
+    }
+  } catch(e) {
+    console.error("[Telegram] 转发失败:", e.message);
+  }
+}
+
+// Telegram 消息轮询
+async function startTelegramBot(tenantId) {
+  const cfg = getTelegramConfig(tenantId);
+  if (!cfg.enabled || !cfg.botToken || !cfg.chatId) return;
+  if (telegramBots[tenantId]) return;
+  
+  const bot = { offset: 0, shouldStop: false };
+  telegramBots[tenantId] = bot;
+  console.log(`[Telegram][${tenantId}] Bot 已启动`);
+  
+  async function poll() {
+    if (bot.shouldStop) return;
+    try {
+      const cfg = getTelegramConfig(tenantId);
+      const url = `https://api.telegram.org/bot${cfg.botToken}/getUpdates?offset=${bot.offset + 1}&timeout=30`;
+      const res = await fetch(url);
+      const data = await res.json();
+      if (data.ok && data.result.length > 0) {
+        for (const update of data.result) {
+          bot.offset = update.update_id;
+          handleTelegramUpdate(tenantId, update);
+        }
+      }
+    } catch (e) {
+      if (!bot.shouldStop) console.error(`[Telegram][${tenantId}] 轮询错误: ${e.message}`);
+    }
+    if (!bot.shouldStop) setTimeout(poll, 1000);
+  }
+  poll();
+}
+
+function handleTelegramUpdate(tenantId, update) {
+  const msg = update.message || update.edited_message;
+  if (!msg) return;
+  
+  const topicId = msg.message_thread_id;
+  if (!topicId) return; // 不是话题消息，忽略
+  
+  const mapping = telegramTopicMap[tenantId]?.[topicId];
+  if (!mapping) {
+    console.log(`[Telegram][${tenantId}] 话题 ${topicId} 没有对应的微信会话`);
+    return;
+  }
+  
+  const { accountId, userId } = mapping;
+  const account = weixinAccounts[accountId];
+  if (!account) return;
+  
+  // 处理文字消息
+  if (msg.text) {
+    const text = msg.text;
+    // 忽略机器人自己发的消息
+    if (msg.from?.is_bot) return;
+    
+    // 处理命令
+    if (text === "/delete" || text === "/删除" || text === "/clear") {
+      (async () => {
+        try {
+          const conv = getConversation(accountId, userId);
+          const remark = conv.remark || userId.slice(0, 12);
+          
+          // 先发确认消息（话题关闭前）
+          await tgSendMessage(tenantId, `✅ 已删除对话「${remark}」，话题即将关闭。`, topicId);
+          
+          // 删除微信会话记录
+          const accData = store.accounts[accountId];
+          if (accData && accData.conversations) {
+            delete accData.conversations[userId];
+          }
+          
+          // 删除话题映射
+          if (telegramTopicMap[tenantId]) {
+            delete telegramTopicMap[tenantId][topicId];
+          }
+          
+          // 关闭 Telegram 话题
+          try {
+            await tgApi(tenantId, "closeForumTopic", {
+              chat_id: getTelegramConfig(tenantId).chatId,
+              message_thread_id: topicId
+            });
+          } catch (e) {
+            console.error(`[Telegram][${tenantId}] 关闭话题失败: ${e.message}`);
+          }
+          
+          scheduleSave();
+          console.log(`[Telegram][${tenantId}] 已删除对话: ${accountId} -> ${userId} (${remark})`);
+        } catch (e) {
+          console.error(`[Telegram][${tenantId}] 删除对话失败: ${e.message}`);
+          try { await tgSendMessage(tenantId, `❌ 删除失败: ${e.message}`, topicId); } catch {}
+        }
+      })();
+      return;
+    }
+    
+    // 帮助命令
+    if (text === "/help" || text === "/帮助") {
+      tgSendMessage(tenantId, "📋 可用命令：\n/delete - 删除当前对话并关闭话题\n/help - 显示帮助", topicId);
+      return;
+    }
+    
+    (async () => {
+      try {
+        const item = { type: 1, text_item: { text } };
+        await weixinSendMessage(account, userId, item, account.contextTokens[userId] || "");
+        const conv = getConversation(accountId, userId);
+        store.nextMsgId++;
+        const msgData = { id: store.nextMsgId, text, from: "me", time: Math.floor(Date.now() / 1000), source: "tele";
