@@ -13,6 +13,10 @@
 
 另含：`package.json`、`requirements-tg-bridge.txt`、`create_menu.mjs`、`qr_template.png`、`pm2/ecosystem-processes.json`。
 
+## 主程序备份
+
+主程序存储为多个 base64 分片；clone 后运行 `bash decode-main.sh` 重建 `wechat_standalone_v3.mjs`。
+
 ## 配置文件
 
 - `wechat_mp_config.json`、`tg_bridge.env`、`qr_config.json`：当时运行配置（私有库内保留，便于完整回滚）
