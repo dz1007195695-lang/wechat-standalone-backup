@@ -1,0 +1,6 @@
+bundle.tgz
+node_modules/
+*.session
+*.session-journal
+wechat-accounts/
+wechat_data.json
